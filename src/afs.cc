@@ -738,6 +738,128 @@ class SharedRingBufferInputStream : public arrow::io::InputStream {
 	bool is_open_;
 };
 
+// This object is valid between a
+// SPI_execute()/SPI_execute_plan_extended() call.
+class PGResultBuffer : public arrow::Buffer {
+   public:
+	PGResultBuffer(int64_t size) : Buffer(nullptr, size) {}
+
+	virtual arrow::Status write_to(arrow::io::OutputStream* output) = 0;
+};
+
+class PGResultStringOffsetsBuffer : public PGResultBuffer {
+   public:
+	PGResultStringOffsetsBuffer(int iAttribute)
+		: PGResultBuffer(static_cast<size_t>(sizeof(int32_t) * (SPI_processed + 1))),
+		  iAttribute_(iAttribute)
+	{
+	}
+
+	arrow::Status write_to(arrow::io::OutputStream* output) override
+	{
+		std::vector<int32_t> offsets;
+		size_t batchSize = 10000;
+		offsets.reserve(batchSize);
+		int32_t offset = 0;
+		offsets.push_back(offset);
+		for (uint64_t iTuple = 0; iTuple < SPI_processed; ++iTuple)
+		{
+			bool isNull;
+			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple],
+			                           SPI_tuptable->tupdesc,
+			                           iAttribute_ + 1,
+			                           &isNull);
+			offset += VARSIZE_ANY_EXHDR(datum);
+			offsets.push_back(offset);
+			if (offsets.size() == batchSize)
+			{
+				ARROW_RETURN_NOT_OK(
+					output->Write(offsets.data(), sizeof(int32_t) * offsets.size()));
+				offsets.clear();
+			}
+			// ARROW_RETURN_NOT_OK(output->Write(&offset, sizeof(int32_t)));
+		}
+		if (!offsets.empty())
+		{
+			ARROW_RETURN_NOT_OK(
+				output->Write(offsets.data(), sizeof(int32_t) * offsets.size()));
+		}
+		return arrow::Status::OK();
+	}
+
+   private:
+	int iAttribute_;
+};
+
+class PGResultStringValuesBuffer : public PGResultBuffer {
+   public:
+	PGResultStringValuesBuffer(int iAttribute)
+		: PGResultBuffer(compute_size(iAttribute)), iAttribute_(iAttribute)
+	{
+	}
+
+	arrow::Status write_to(arrow::io::OutputStream* output) override
+	{
+		std::string buffer;
+		size_t bufferSize = 4096000;
+		buffer.reserve(bufferSize);
+		for (uint64_t iTuple = 0; iTuple < SPI_processed; ++iTuple)
+		{
+			bool isNull;
+			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple],
+			                           SPI_tuptable->tupdesc,
+			                           iAttribute_ + 1,
+			                           &isNull);
+			if (buffer.size() + VARSIZE_ANY_EXHDR(datum) > bufferSize)
+			{
+				ARROW_RETURN_NOT_OK(output->Write(buffer.data(), buffer.size()));
+				buffer.clear();
+			}
+			buffer.append(VARDATA_ANY(datum), VARSIZE_ANY_EXHDR(datum));
+			// ARROW_RETURN_NOT_OK(output->Write(VARDATA_ANY(datum),
+			// VARSIZE_ANY_EXHDR(datum)));
+		}
+		if (!buffer.empty())
+		{
+			ARROW_RETURN_NOT_OK(output->Write(buffer.data(), buffer.size()));
+		}
+		return arrow::Status::OK();
+	}
+
+   private:
+	int64_t compute_size(int iAttribute)
+	{
+		int64_t size = 0;
+		for (uint64_t iTuple = 0; iTuple < SPI_processed; ++iTuple)
+		{
+			bool isNull;
+			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple],
+			                           SPI_tuptable->tupdesc,
+			                           iAttribute + 1,
+			                           &isNull);
+			size += VARSIZE_ANY_EXHDR(datum);
+		}
+		return size;
+	}
+
+	int iAttribute_;
+};
+
+class PGResultStringArray : public arrow::StringArray {
+   public:
+	PGResultStringArray(int64_t length,
+	                    const std::shared_ptr<arrow::Buffer>& value_offsets,
+	                    const std::shared_ptr<arrow::Buffer>& data,
+	                    const std::shared_ptr<arrow::Buffer>& null_bitmap = nullptr,
+	                    int64_t null_count = arrow::kUnknownNullCount,
+	                    int64_t offset = 0)
+		: arrow::StringArray(length, value_offsets, data, null_bitmap, null_count, offset)
+	{
+	}
+
+	offset_type total_values_length() const override { return value_data()->size(); }
+};
+
 class SharedRingBufferOutputStream : public arrow::io::OutputStream {
    public:
 	SharedRingBufferOutputStream(Processor* processor,
@@ -760,9 +882,65 @@ class SharedRingBufferOutputStream : public arrow::io::OutputStream {
 
 	arrow::Result<int64_t> Tell() const override { return position_; }
 
-	arrow::Status Write(const void* data, int64_t nBytes) override;
+	arrow::Status Write(const void* data, int64_t nBytes) override
+	{
+		if (ARROW_PREDICT_FALSE(!is_open_))
+		{
+			return arrow::Status::IOError(std::string(Tag) + ": " + processor_->tag() +
+			                              ": SharedRingBufferOutputStream is closed");
+		}
+		if (ARROW_PREDICT_TRUE(nBytes > 0))
+		{
+			SharedRingBuffer buffer(localSession_->bufferData,
+			                        localSession_->bufferAddress,
+			                        processor_->tag());
+			size_t rest = static_cast<size_t>(nBytes);
+			while (true)
+			{
+				ARROW_ASSIGN_OR_RAISE(
+					auto writtenBytes,
+					processor_->write(localSession_.get(), &buffer, data, rest));
+				if (INTERRUPTS_PENDING_CONDITION())
+				{
+					return arrow::Status::IOError(std::string(Tag) + ": " +
+					                              processor_->tag() + ": interrupted");
+				}
 
-	using arrow::io::OutputStream::Write;
+				if (writtenBytes == 0)
+				{
+					ARROW_RETURN_NOT_OK(processor_->wait(
+						localSession_.get(), &buffer, Processor::WaitMode::Read));
+					if (INTERRUPTS_PENDING_CONDITION())
+					{
+						return arrow::Status::IOError(std::string(Tag) + ": " +
+						                              processor_->tag() +
+						                              ": interrupted");
+					}
+					continue;
+				}
+
+				position_ += writtenBytes;
+				rest -= writtenBytes;
+				data = static_cast<const uint8_t*>(data) + writtenBytes;
+
+				if (ARROW_PREDICT_TRUE(rest == 0))
+				{
+					break;
+				}
+			}
+		}
+		return arrow::Status::OK();
+	}
+
+	arrow::Status Write(const std::shared_ptr<arrow::Buffer>& buffer) override
+	{
+		const auto& pgBuffer = std::dynamic_pointer_cast<PGResultBuffer>(buffer);
+		if (!pgBuffer)
+		{
+			return Write(buffer->data(), buffer->size());
+		}
+		return pgBuffer->write_to(this);
+	}
 
    private:
 	Processor* processor_;
@@ -1954,74 +2132,86 @@ class Executor : public WorkerProcessor {
 		// Write another stream format data with record batches.
 		ARROW_ASSIGN_OR_RAISE(writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
-		uint64_t iTuple = 0;
-		for (; iTuple < SPI_processed; iTuple += MaxNRowsPerRecordBatch)
+		std::vector<std::shared_ptr<arrow::Array>> columns;
+		for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts; ++iAttribute)
 		{
-			uint64_t iTupleEnd = iTuple + MaxNRowsPerRecordBatch;
-			if (iTupleEnd >= SPI_processed)
-			{
-				iTupleEnd = SPI_processed;
-			}
-			P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  iTupleEnd);
-			for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
-			     ++iAttribute)
-			{
-				P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64 ": %d/%d",
-				  Tag,
-				  tag_,
-				  tag,
-				  iTuple,
-				  iTupleEnd,
-				  iAttribute,
-				  SPI_tuptable->tupdesc->natts);
-				ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, iTupleEnd));
-			}
-			ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
-			P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  iTupleEnd);
+			auto valueOffsets = std::make_shared<PGResultStringOffsetsBuffer>(iAttribute);
+			auto values = std::make_shared<PGResultStringValuesBuffer>(iAttribute);
+			columns.push_back(std::make_shared<PGResultStringArray>(
+				SPI_processed, std::move(valueOffsets), std::move(values), nullptr, 0));
+		}
+		{
+			auto recordBatch = arrow::RecordBatch::Make(schema, SPI_processed, columns);
 			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		}
+		// uint64_t iTuple = 0;
+		// for (; iTuple < SPI_processed; iTuple += MaxNRowsPerRecordBatch)
+		// {
+		// uint64_t iTupleEnd = iTuple + MaxNRowsPerRecordBatch;
+		// if (iTupleEnd >= SPI_processed)
+		// {
+		// 	iTupleEnd = SPI_processed;
+		// }
+		// P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64,
+		//   Tag,
+		//   tag_,
+		//   tag,
+		//   iTuple,
+		//   iTupleEnd);
+		// for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
+		//      ++iAttribute)
+		// {
+		// 	P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64 ": %d/%d",
+		// 	  Tag,
+		// 	  tag_,
+		// 	  tag,
+		// 	  iTuple,
+		// 	  iTupleEnd,
+		// 	  iAttribute,
+		// 	  SPI_tuptable->tupdesc->natts);
+		// 	ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, iTupleEnd));
+		// }
+		// ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
+		// P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
+		//   Tag,
+		//   tag_,
+		//   tag,
+		//   iTuple,
+		//   iTupleEnd);
+		// ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+		// }
 
-		if (iTuple < SPI_processed)
-		{
-			P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  SPI_processed);
-			for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
-			     ++iAttribute)
-			{
-				P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64
-				  ": %d/%d",
-				  Tag,
-				  tag_,
-				  tag,
-				  iTuple,
-				  SPI_processed,
-				  iAttribute,
-				  SPI_tuptable->tupdesc->natts);
-				ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, SPI_processed));
-			}
-			ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
-			P("%s: %s: %s: write: data: WriteRecordBatch: last: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  SPI_processed);
-			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
-		}
+		// if (iTuple < SPI_processed)
+		// {
+		// 	P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64,
+		// 	  Tag,
+		// 	  tag_,
+		// 	  tag,
+		// 	  iTuple,
+		// 	  SPI_processed);
+		// 	for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
+		// 	     ++iAttribute)
+		// 	{
+		// 		P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64
+		// 		  ": %d/%d",
+		// 		  Tag,
+		// 		  tag_,
+		// 		  tag,
+		// 		  iTuple,
+		// 		  SPI_processed,
+		// 		  iAttribute,
+		// 		  SPI_tuptable->tupdesc->natts);
+		// 		ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, SPI_processed));
+		// 	}
+		// 	ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
+		// 	P("%s: %s: %s: write: data: WriteRecordBatch: last: %" PRIu64 "/%" PRIu64,
+		// 	  Tag,
+		// 	  tag_,
+		// 	  tag,
+		// 	  iTuple,
+		// 	  SPI_processed);
+		// 	ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+		// }
 		P("%s: %s: %s, write: data: Close", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->Close());
 		return output.Close();
@@ -2313,55 +2503,6 @@ class Executor : public WorkerProcessor {
 	uint64_t nextPreparedStatementID_;
 	std::map<std::string, PreparedStatement> preparedStatements_;
 };
-
-arrow::Status
-SharedRingBufferOutputStream::Write(const void* data, int64_t nBytes)
-{
-	if (ARROW_PREDICT_FALSE(!is_open_))
-	{
-		return arrow::Status::IOError(std::string(Tag) + ": " + processor_->tag() +
-		                              ": SharedRingBufferOutputStream is closed");
-	}
-	if (ARROW_PREDICT_TRUE(nBytes > 0))
-	{
-		SharedRingBuffer buffer(
-			localSession_->bufferData, localSession_->bufferAddress, processor_->tag());
-		size_t rest = static_cast<size_t>(nBytes);
-		while (true)
-		{
-			ARROW_ASSIGN_OR_RAISE(
-				auto writtenBytes,
-				processor_->write(localSession_.get(), &buffer, data, rest));
-			if (INTERRUPTS_PENDING_CONDITION())
-			{
-				return arrow::Status::IOError(std::string(Tag) + ": " +
-				                              processor_->tag() + ": interrupted");
-			}
-
-			if (writtenBytes == 0)
-			{
-				ARROW_RETURN_NOT_OK(processor_->wait(
-					localSession_.get(), &buffer, Processor::WaitMode::Read));
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return arrow::Status::IOError(std::string(Tag) + ": " +
-					                              processor_->tag() + ": interrupted");
-				}
-				continue;
-			}
-
-			position_ += writtenBytes;
-			rest -= writtenBytes;
-			data = static_cast<const uint8_t*>(data) + writtenBytes;
-
-			if (ARROW_PREDICT_TRUE(rest == 0))
-			{
-				break;
-			}
-		}
-	}
-	return arrow::Status::OK();
-}
 
 // There is only one Proxy object in a PostgreSQL instance. The Proxy
 // object communicates multiple "executor" processes.
